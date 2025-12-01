@@ -1,0 +1,4 @@
+# EVE Online LP Store Optimizer Dependencies
+
+# HTTP library for ESI API requests
+requests>=2.31.0
