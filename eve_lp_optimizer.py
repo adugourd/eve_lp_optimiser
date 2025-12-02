@@ -280,6 +280,7 @@ class ItemAnalysis:
     profit_per_purchase: float
     net_isk_per_lp: float
     daily_volume_purchases: float   # Market can absorb this many purchases/day
+    lp_per_m3: float                # LP cost per m³ (cargo efficiency)
 
 
 def analyze_items(items: List[LPStoreItem], esi: ESIClient) -> List[ItemAnalysis]:
@@ -327,7 +328,8 @@ def analyze_items(items: List[LPStoreItem], esi: ESIClient) -> List[ItemAnalysis
         
         net_isk_per_lp = profit / item.lp_cost
         daily_volume_purchases = faction_market.daily_volume / item.units_per_purchase
-        
+        lp_per_m3 = item.lp_cost / item.volume_per_purchase if item.volume_per_purchase > 0 else 0
+
         analysis = ItemAnalysis(
             item=item,
             base_market=base_market,
@@ -337,7 +339,8 @@ def analyze_items(items: List[LPStoreItem], esi: ESIClient) -> List[ItemAnalysis
             total_cost_per_purchase=total_cost,
             profit_per_purchase=profit,
             net_isk_per_lp=net_isk_per_lp,
-            daily_volume_purchases=daily_volume_purchases
+            daily_volume_purchases=daily_volume_purchases,
+            lp_per_m3=lp_per_m3
         )
         analyses.append(analysis)
         
@@ -350,51 +353,86 @@ def optimize_purchases(
     analyses: List[ItemAnalysis],
     available_lp: int,
     cargo_capacity: float,
-    min_liquidity: float = 1.0,
-    max_days_to_sell: float = 7.0
+    min_liquidity: float = 0.3,
+    max_days_to_sell: float = 14.0,
+    diversify: bool = True,
+    batch_size_days: float = 4.0,
+    lp_density_weight: float = 0.7
 ) -> List[Tuple[ItemAnalysis, int]]:
     """
-    Optimize LP store purchases using a greedy algorithm with liquidity constraints.
+    Optimize LP store purchases with optional diversification to spread across items.
 
-    Sorts items by ISK/LP ratio (penalized for slow-selling items), then allocates
-    LP and cargo capacity to the most profitable items first. Respects market depth
-    to avoid purchasing more than can be sold within the specified timeframe.
+    Uses either a diversified round-robin allocation (default) or greedy allocation.
+    Diversification helps avoid concentrating too much volume in single items,
+    reducing time to liquidate and market risk.
 
     Args:
         analyses: List of analyzed LP store items with market data
         available_lp: Total LP points available to spend
         cargo_capacity: Maximum cargo volume in m³
-        min_liquidity: Minimum daily volume in purchases/day (default: 1.0)
-        max_days_to_sell: Maximum days to sell inventory (default: 7.0)
+        min_liquidity: Minimum daily volume in purchases/day (default: 0.3)
+        max_days_to_sell: Maximum days to sell inventory (default: 14.0)
+        diversify: Use diversified allocation instead of greedy (default: True)
+        batch_size_days: Days worth of volume to allocate per round (default: 4.0)
+        lp_density_weight: Weight for LP/m³ in scoring (0-1, default: 0.7)
+                          0 = pure ISK/LP optimization, 1 = pure LP density optimization
 
     Returns:
         List of (ItemAnalysis, quantity) tuples where quantity is the number
         of LP store purchases to make for each item.
     """
-    
+
     # Filter out items with insufficient market liquidity
     viable_items = [a for a in analyses if a.daily_volume_purchases >= min_liquidity]
     if not viable_items:
         print("Warning: No items meet liquidity requirements, using all items")
         viable_items = analyses.copy()
 
-    # Sort by ISK/LP, penalizing slow sellers to avoid inventory buildup
+    # Calculate average LP density for normalization
+    avg_lp_per_m3 = sum(a.lp_per_m3 for a in viable_items) / len(viable_items) if viable_items else 1.0
+
+    # Hybrid sorting: balance ISK/LP profitability with LP density (cargo efficiency)
     def sort_key(a: ItemAnalysis) -> float:
+        # Start with ISK/LP
         base_value = a.net_isk_per_lp
+
+        # Apply liquidity penalty for slow sellers
         if a.daily_volume_purchases > 0:
             days_to_sell_one = 1 / a.daily_volume_purchases
-            # Apply penalty if item takes too long to sell
             if days_to_sell_one > max_days_to_sell:
                 base_value *= (max_days_to_sell / days_to_sell_one)
+
+        # Apply LP density boost (favors items that pack more LP per m³)
+        if lp_density_weight > 0 and avg_lp_per_m3 > 0:
+            density_factor = (a.lp_per_m3 / avg_lp_per_m3) ** lp_density_weight
+            base_value *= density_factor
+
         return base_value
-    
+
     viable_items.sort(key=sort_key, reverse=True)
-    
+
+    if not diversify:
+        # Original greedy algorithm - allocate everything to best items first
+        return _greedy_allocation(viable_items, available_lp, cargo_capacity, max_days_to_sell)
+    else:
+        # Diversified round-robin allocation - spread across multiple items
+        return _diversified_allocation(
+            viable_items, available_lp, cargo_capacity,
+            max_days_to_sell, batch_size_days
+        )
+
+
+def _greedy_allocation(
+    viable_items: List[ItemAnalysis],
+    available_lp: int,
+    cargo_capacity: float,
+    max_days_to_sell: float
+) -> List[Tuple[ItemAnalysis, int]]:
+    """Original greedy allocation - fills up on best items first."""
     purchases: List[Tuple[ItemAnalysis, int]] = []
     remaining_lp = available_lp
     remaining_cargo = cargo_capacity
-    
-    # Greedy allocation: process items in order of profitability
+
     for analysis in viable_items:
         if remaining_lp <= 0 or remaining_cargo <= 0:
             break
@@ -412,12 +450,78 @@ def optimize_purchases(
 
         # Take minimum of all constraints (at least 1 if possible)
         quantity = min(max_by_lp, max_by_cargo, max(1, max_by_volume))
-        
+
         if quantity > 0:
             purchases.append((analysis, quantity))
             remaining_lp -= quantity * item.lp_cost
             remaining_cargo -= quantity * item.volume_per_purchase
-    
+
+    return purchases
+
+
+def _diversified_allocation(
+    viable_items: List[ItemAnalysis],
+    available_lp: int,
+    cargo_capacity: float,
+    max_days_to_sell: float,
+    batch_size_days: float
+) -> List[Tuple[ItemAnalysis, int]]:
+    """
+    Diversified round-robin allocation - spreads purchases across items.
+
+    Allocates in batches (e.g., 2 days worth of volume per item per round)
+    to avoid concentrating heavily on single items.
+    """
+    # Track allocations per item using list of (analysis, quantity) tuples
+    allocations = [[analysis, 0] for analysis in viable_items]
+    remaining_lp = available_lp
+    remaining_cargo = cargo_capacity
+
+    # Keep allocating in rounds until resources exhausted
+    allocation_made = True
+    while allocation_made and remaining_lp > 0 and remaining_cargo > 0:
+        allocation_made = False
+
+        # Try to allocate to each item in priority order
+        for alloc_entry in allocations:
+            if remaining_lp <= 0 or remaining_cargo <= 0:
+                break
+
+            analysis = alloc_entry[0]
+            current_qty = alloc_entry[1]
+            item = analysis.item
+
+            # Calculate batch size: smaller of batch_size_days or remaining capacity
+            if analysis.daily_volume_purchases > 0:
+                # Allocate batch_size_days worth of volume at a time
+                batch_purchases = max(1, int(analysis.daily_volume_purchases * batch_size_days))
+                # But never exceed max_days_to_sell total for this item
+                max_total = int(analysis.daily_volume_purchases * max_days_to_sell)
+                remaining_for_item = max(0, max_total - current_qty)
+                batch_purchases = min(batch_purchases, remaining_for_item)
+            else:
+                batch_purchases = 1
+                remaining_for_item = 1 - current_qty
+
+            if remaining_for_item <= 0:
+                continue
+
+            # Apply resource constraints
+            max_by_lp = remaining_lp // item.lp_cost
+            max_by_cargo = int(remaining_cargo // item.volume_per_purchase)
+
+            # Allocate the minimum of all constraints
+            quantity = min(batch_purchases, max_by_lp, max_by_cargo)
+
+            if quantity > 0:
+                alloc_entry[1] += quantity
+                remaining_lp -= quantity * item.lp_cost
+                remaining_cargo -= quantity * item.volume_per_purchase
+                allocation_made = True
+
+    # Convert to list of tuples, filtering out zero allocations
+    purchases = [(analysis, qty) for analysis, qty in allocations if qty > 0]
+
     return purchases
 
 
@@ -555,15 +659,27 @@ def main():
     parser.add_argument("--lp", type=int, required=True, help="Available LP")
     parser.add_argument("--cargo", type=float, required=True, help="Cargo capacity in m³")
     parser.add_argument("--output", type=str, default="multibuy.txt", help="Output filename")
-    parser.add_argument("--max-days", type=float, default=7.0, help="Max days to sell")
-    parser.add_argument("--min-liquidity", type=float, default=0.5, help="Min daily volume")
+    parser.add_argument("--max-days", type=float, default=14.0, help="Max days to sell inventory (default: 14)")
+    parser.add_argument("--min-liquidity", type=float, default=0.3, help="Min daily volume in purchases/day (default: 0.3)")
     parser.add_argument("--sample", action="store_true", help="Use sample data")
     parser.add_argument(
         "--categories", type=str, nargs="+",
         choices=["ammo_s", "ammo_m", "ammo_l", "drone_light", "drone_medium"],
         help="Limit to categories"
     )
-    
+    parser.add_argument(
+        "--no-diversify", action="store_true",
+        help="Use greedy allocation instead of diversified (concentrates on fewer items)"
+    )
+    parser.add_argument(
+        "--batch-days", type=float, default=4.0,
+        help="Days worth of volume to allocate per round when diversifying (default: 4.0)"
+    )
+    parser.add_argument(
+        "--lp-density", type=float, default=0.7,
+        help="Weight for LP/m³ optimization (0-1, default: 0.7). Higher = favor denser items to use more LP per cargo"
+    )
+
     args = parser.parse_args()
     
     print(f"\nEVE LP Store Optimizer (Tribal Liberation Force)")
@@ -587,11 +703,18 @@ def main():
         return 1
     
     print(f"\nOptimizing {len(analyses)} profitable items...")
-    
+    if not args.no_diversify:
+        print(f"Using diversified allocation (batch size: {args.batch_days} days)")
+    else:
+        print("Using greedy allocation (may concentrate on fewer items)")
+
     purchases = optimize_purchases(
         analyses, args.lp, args.cargo,
         min_liquidity=args.min_liquidity,
-        max_days_to_sell=args.max_days
+        max_days_to_sell=args.max_days,
+        diversify=not args.no_diversify,
+        batch_size_days=args.batch_days,
+        lp_density_weight=args.lp_density
     )
     
     if not purchases:
