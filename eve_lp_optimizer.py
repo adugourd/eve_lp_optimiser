@@ -20,7 +20,7 @@ import time
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
 from datetime import datetime
-import argparse
+import typer
 
 
 # =============================================================================
@@ -643,110 +643,116 @@ def generate_report(
     return "\n".join(lines)
 
 
-def main():
-    """
-    Main entry point for the LP optimizer.
+app = typer.Typer()
 
-    Parses command-line arguments, fetches market data, optimizes purchases,
-    and generates output files (multi-buy list and detailed report).
 
-    Returns:
-        Exit code (0 for success, 1 for error)
-    """
-    parser = argparse.ArgumentParser(
-        description="EVE Online LP Store Optimizer for Tribal Liberation Force"
-    )
-    parser.add_argument("--lp", type=int, required=True, help="Available LP")
-    parser.add_argument("--cargo", type=float, required=True, help="Cargo capacity in m³")
-    parser.add_argument("--output", type=str, default="multibuy.txt", help="Output filename")
-    parser.add_argument("--max-days", type=float, default=14.0, help="Max days to sell inventory (default: 14)")
-    parser.add_argument("--min-liquidity", type=float, default=0.3, help="Min daily volume in purchases/day (default: 0.3)")
-    parser.add_argument("--sample", action="store_true", help="Use sample data")
-    parser.add_argument(
-        "--categories", type=str, nargs="+",
-        choices=["ammo_s", "ammo_m", "ammo_l", "drone_light", "drone_medium"],
-        help="Limit to categories"
-    )
-    parser.add_argument(
-        "--no-diversify", action="store_true",
+@app.command()
+def main(
+    lp: int = typer.Option(..., help="Available LP"),
+    cargo: float = typer.Option(..., help="Cargo capacity in m³"),
+    output: str = typer.Option("multibuy.txt", help="Output filename"),
+    max_days: float = typer.Option(14.0, "--max-days", help="Max days to sell inventory"),
+    min_liquidity: float = typer.Option(0.3, "--min-liquidity", help="Min daily volume in purchases/day"),
+    sample: bool = typer.Option(False, "--sample", help="Use sample data instead of live API"),
+    categories: Optional[List[str]] = typer.Option(
+        None,
+        "--categories",
+        help="Limit to specific categories (choices: ammo_s, ammo_m, ammo_l, drone_light, drone_medium)"
+    ),
+    no_diversify: bool = typer.Option(
+        False,
+        "--no-diversify",
         help="Use greedy allocation instead of diversified (concentrates on fewer items)"
-    )
-    parser.add_argument(
-        "--batch-days", type=float, default=4.0,
-        help="Days worth of volume to allocate per round when diversifying (default: 4.0)"
-    )
-    parser.add_argument(
-        "--lp-density", type=float, default=0.7,
-        help="Weight for LP/m³ optimization (0-1, default: 0.7). Higher = favor denser items to use more LP per cargo"
-    )
+    ),
+    batch_days: float = typer.Option(
+        4.0,
+        "--batch-days",
+        help="Days worth of volume to allocate per round when diversifying"
+    ),
+    lp_density: float = typer.Option(
+        0.7,
+        "--lp-density",
+        help="Weight for LP/m³ optimization (0-1). Higher = favor denser items to use more LP per cargo"
+    ),
+):
+    """
+    EVE Online LP Store Optimizer for Tribal Liberation Force.
 
-    args = parser.parse_args()
-    
+    Calculates optimal LP store purchases considering market prices,
+    liquidity constraints, and cargo capacity.
+    """
+    # Validate categories if provided
+    valid_categories = ["ammo_s", "ammo_m", "ammo_l", "drone_light", "drone_medium"]
+    if categories:
+        invalid = [c for c in categories if c not in valid_categories]
+        if invalid:
+            typer.echo(f"Error: Invalid categories: {', '.join(invalid)}")
+            typer.echo(f"Valid choices: {', '.join(valid_categories)}")
+            raise typer.Exit(1)
+
     print(f"\nEVE LP Store Optimizer (Tribal Liberation Force)")
     print(f"=" * 55)
-    print(f"LP Available: {args.lp:,}")
-    print(f"Cargo: {args.cargo:,.1f} m³")
-    if args.sample:
+    print(f"LP Available: {lp:,}")
+    print(f"Cargo: {cargo:,.1f} m³")
+    if sample:
         print("Mode: SAMPLE DATA (run without --sample for live prices)")
     print()
-    
+
     items = LP_STORE_ITEMS
-    if args.categories:
-        items = [i for i in items if i.category in args.categories]
-        print(f"Categories: {', '.join(args.categories)}")
-    
-    esi = ESIClient(use_sample=args.sample)
+    if categories:
+        items = [i for i in items if i.category in categories]
+        print(f"Categories: {', '.join(categories)}")
+
+    esi = ESIClient(use_sample=sample)
     analyses = analyze_items(items, esi)
-    
+
     if not analyses:
         print("Error: No profitable items found")
-        return 1
-    
+        raise typer.Exit(1)
+
     print(f"\nOptimizing {len(analyses)} profitable items...")
-    if not args.no_diversify:
-        print(f"Using diversified allocation (batch size: {args.batch_days} days)")
+    if not no_diversify:
+        print(f"Using diversified allocation (batch size: {batch_days} days)")
     else:
         print("Using greedy allocation (may concentrate on fewer items)")
 
     purchases = optimize_purchases(
-        analyses, args.lp, args.cargo,
-        min_liquidity=args.min_liquidity,
-        max_days_to_sell=args.max_days,
-        diversify=not args.no_diversify,
-        batch_size_days=args.batch_days,
-        lp_density_weight=args.lp_density
+        analyses, lp, cargo,
+        min_liquidity=min_liquidity,
+        max_days_to_sell=max_days,
+        diversify=not no_diversify,
+        batch_size_days=batch_days,
+        lp_density_weight=lp_density
     )
-    
+
     if not purchases:
         print("Error: No viable purchases")
-        return 1
-    
-    report = generate_report(purchases, args.lp, args.cargo)
+        raise typer.Exit(1)
+
+    report = generate_report(purchases, lp, cargo)
     print()
     print(report)
-    
+
     # Generate multi-buy for BASE items
     multibuy = generate_multibuy(purchases)
-    
-    with open(args.output, 'w') as f:
+
+    with open(output, 'w') as f:
         f.write(multibuy)
-    
-    print(f"Multi-buy (BASE items to purchase) saved to: {args.output}")
+
+    print(f"Multi-buy (BASE items to purchase) saved to: {output}")
     print("-" * 55)
     print(multibuy)
     print("-" * 55)
-    
-    report_file = args.output.rsplit('.', 1)[0] + "_report.txt"
+
+    report_file = output.rsplit('.', 1)[0] + "_report.txt"
     with open(report_file, 'w') as f:
         f.write(report)
         f.write("\n\nMULTI-BUY (Base items to buy from market):\n")
         f.write("-" * 55 + "\n")
         f.write(multibuy)
-    
+
     print(f"Report saved to: {report_file}")
-    
-    return 0
 
 
 if __name__ == "__main__":
-    exit(main())
+    app()
