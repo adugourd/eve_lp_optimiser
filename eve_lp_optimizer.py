@@ -162,6 +162,7 @@ class MarketData:
     price: float           # Sell order price (what you pay to buy / compete with to sell)
     daily_volume: float    # Average daily volume traded
     available_volume: int  # Volume available at or near the price
+    sell_orders: List[Dict] = None  # Full order book for accurate cost calculation
 
 
 class ESIClient:
@@ -224,8 +225,8 @@ class ESIClient:
     def get_market_data(self, type_id: int, is_base_item: bool = False) -> Optional[MarketData]:
         """
         Get market data for an item.
-        For base items: we want sell prices (what we pay to buy)
-        For faction items: we want sell prices (competition) and depth
+        For base items: we want sell prices (what we pay to buy) - stores full order book
+        For faction items: we want sell prices (competition) and depth - uses lowest price
         """
         if self.use_sample:
             sample_dict = SAMPLE_BASE_PRICES if is_base_item else SAMPLE_FACTION_PRICES
@@ -235,23 +236,40 @@ class ESIClient:
                     type_id=type_id,
                     price=price,
                     daily_volume=volume,
-                    available_volume=int(volume * 10)  # Estimate
+                    available_volume=int(volume * 10),  # Estimate
+                    sell_orders=[]
                 )
             return None
-        
+
         orders = self.get_sell_orders(THE_FORGE_REGION_ID, type_id)
         if not orders:
             return None
-        
-        # Get lowest price and volume at/near that price (within 5%)
-        # This represents realistic available volume before getting undercut
+
         min_price = orders[0]['price']
-        price_threshold = min_price * 1.05
-        available_volume = sum(
-            o['volume_remain'] for o in orders
-            if o['price'] <= price_threshold
-        )
-        
+
+        if is_base_item:
+            # For base items: store orders for later accurate cost calculation
+            # Price here is just for reference (actual cost calculated per quantity)
+            price_threshold = min_price * 1.10
+            relevant_orders = [o for o in orders if o['price'] <= price_threshold][:20]
+
+            total_value = sum(o['price'] * o['volume_remain'] for o in relevant_orders)
+            total_volume = sum(o['volume_remain'] for o in relevant_orders)
+            weighted_price = total_value / total_volume if total_volume > 0 else min_price
+
+            available_volume = total_volume
+            stored_orders = orders  # Store full order book
+        else:
+            # For faction items: use lowest price (we're competing as sellers)
+            # Calculate available volume within 5% of min price
+            price_threshold = min_price * 1.05
+            available_volume = sum(
+                o['volume_remain'] for o in orders
+                if o['price'] <= price_threshold
+            )
+            weighted_price = min_price
+            stored_orders = None  # Don't need order book for faction items
+
         # Get daily volume from history
         history = self.get_market_history(THE_FORGE_REGION_ID, type_id)
         if history:
@@ -259,13 +277,47 @@ class ESIClient:
             daily_volume = sum(h['volume'] for h in recent) / len(recent)
         else:
             daily_volume = 0
-        
+
         return MarketData(
             type_id=type_id,
-            price=min_price,
+            price=weighted_price,
             daily_volume=daily_volume,
-            available_volume=available_volume
+            available_volume=available_volume,
+            sell_orders=stored_orders
         )
+
+
+def calculate_purchase_cost(orders: List[Dict], quantity_needed: int) -> float:
+    """
+    Calculate the actual cost to buy a specific quantity by walking through the order book.
+
+    Args:
+        orders: List of sell orders sorted by price (lowest first)
+        quantity_needed: Total units to purchase
+
+    Returns:
+        Total ISK cost to purchase the quantity
+    """
+    if not orders:
+        return 0.0
+
+    total_cost = 0.0
+    remaining = quantity_needed
+
+    for order in orders:
+        if remaining <= 0:
+            break
+
+        available = order['volume_remain']
+        to_buy = min(remaining, available)
+        total_cost += to_buy * order['price']
+        remaining -= to_buy
+
+    # If we couldn't fulfill the entire order, use the last price for remaining
+    if remaining > 0 and orders:
+        total_cost += remaining * orders[-1]['price']
+
+    return total_cost
 
 
 @dataclass
@@ -317,7 +369,12 @@ def analyze_items(items: List[LPStoreItem], esi: ESIClient) -> List[ItemAnalysis
             continue
         
         # Calculate costs and revenue per LP store purchase
-        base_cost = base_market.price * item.units_per_purchase
+        # For base items, use actual order book cost if available
+        if base_market.sell_orders:
+            base_cost = calculate_purchase_cost(base_market.sell_orders, item.units_per_purchase)
+        else:
+            base_cost = base_market.price * item.units_per_purchase
+
         faction_revenue = faction_market.price * item.units_per_purchase
         total_cost = base_cost + item.isk_cost
         profit = faction_revenue - total_cost
@@ -610,7 +667,13 @@ def generate_report(
         item = analysis.item
         total_units = quantity * item.units_per_purchase
         lp_used = quantity * item.lp_cost
-        base_cost = quantity * analysis.base_cost_per_purchase
+
+        # Calculate accurate base cost using order book if available
+        if analysis.base_market.sell_orders:
+            base_cost = calculate_purchase_cost(analysis.base_market.sell_orders, total_units)
+        else:
+            base_cost = quantity * analysis.base_cost_per_purchase
+
         isk_cost = quantity * item.isk_cost
         revenue = quantity * analysis.faction_revenue_per_purchase
         volume = quantity * item.volume_per_purchase
