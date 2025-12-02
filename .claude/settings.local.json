@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git init:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git remote add:*)",
+      "Bash(git branch:*)",
+      "Bash(git push:*)",
+      "Bash(python:*)",
+      "Bash(pip install:*)",
+      "Bash(del test_normal.txt test_normal_report.txt test_liquidation.txt test_liquidation_report.txt)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

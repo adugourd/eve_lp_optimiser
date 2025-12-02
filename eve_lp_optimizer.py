@@ -162,7 +162,7 @@ class MarketData:
     price: float           # Sell order price (what you pay to buy / compete with to sell)
     daily_volume: float    # Average daily volume traded
     available_volume: int  # Volume available at or near the price
-    sell_orders: List[Dict] = None  # Full order book for accurate cost calculation
+    sell_orders: List[Dict] = None  # Full order book for accurate cost calculation (base items or liquidation mode)
 
 
 class ESIClient:
@@ -206,12 +206,36 @@ class ESIClient:
             if len(data) < 1000:
                 break
             page += 1
-        
+
         # Filter to Jita and sort by price
         jita_orders = [o for o in orders if o.get('system_id') == JITA_SYSTEM_ID]
         if not jita_orders:
             jita_orders = orders
         return sorted(jita_orders, key=lambda x: x['price'])
+
+    def get_buy_orders(self, region_id: int, type_id: int) -> List[Dict]:
+        """Get buy orders sorted by price (highest first)"""
+        if self.use_sample:
+            return []
+        orders = []
+        page = 1
+        while True:
+            data = self._request(
+                f"/markets/{region_id}/orders/",
+                params={'type_id': type_id, 'order_type': 'buy', 'page': page}
+            )
+            if not data:
+                break
+            orders.extend(data)
+            if len(data) < 1000:
+                break
+            page += 1
+
+        # Filter to Jita and sort by price (highest first)
+        jita_orders = [o for o in orders if o.get('system_id') == JITA_SYSTEM_ID]
+        if not jita_orders:
+            jita_orders = orders
+        return sorted(jita_orders, key=lambda x: x['price'], reverse=True)
     
     def get_market_history(self, region_id: int, type_id: int) -> List[Dict]:
         if self.use_sample:
@@ -222,16 +246,21 @@ class ESIClient:
         )
         return data if data else []
     
-    def get_market_data(self, type_id: int, is_base_item: bool = False) -> Optional[MarketData]:
+    def get_market_data(self, type_id: int, is_base_item: bool = False, use_buy_orders: bool = False) -> Optional[MarketData]:
         """
         Get market data for an item.
         For base items: we want sell prices (what we pay to buy) - stores full order book
-        For faction items: we want sell prices (competition) and depth - uses lowest price
+        For faction items:
+            - Normal mode: sell prices (competition) and depth - uses lowest price
+            - Liquidation mode: buy prices (instant sell) and depth - uses highest price
         """
         if self.use_sample:
             sample_dict = SAMPLE_BASE_PRICES if is_base_item else SAMPLE_FACTION_PRICES
             if type_id in sample_dict:
                 price, volume = sample_dict[type_id]
+                # In liquidation mode with sample data, reduce price by ~10% to simulate buy orders
+                if use_buy_orders and not is_base_item:
+                    price = price * 0.90
                 return MarketData(
                     type_id=type_id,
                     price=price,
@@ -241,15 +270,20 @@ class ESIClient:
                 )
             return None
 
-        orders = self.get_sell_orders(THE_FORGE_REGION_ID, type_id)
+        # For base items, always use sell orders (we're buying)
+        # For faction items, use buy orders in liquidation mode, sell orders otherwise
+        if is_base_item or not use_buy_orders:
+            orders = self.get_sell_orders(THE_FORGE_REGION_ID, type_id)
+        else:
+            orders = self.get_buy_orders(THE_FORGE_REGION_ID, type_id)
+
         if not orders:
             return None
-
-        min_price = orders[0]['price']
 
         if is_base_item:
             # For base items: store orders for later accurate cost calculation
             # Price here is just for reference (actual cost calculated per quantity)
+            min_price = orders[0]['price']
             price_threshold = min_price * 1.10
             relevant_orders = [o for o in orders if o['price'] <= price_threshold][:20]
 
@@ -259,16 +293,28 @@ class ESIClient:
 
             available_volume = total_volume
             stored_orders = orders  # Store full order book
+        elif use_buy_orders:
+            # For faction items in liquidation mode: use highest buy price (instant sell)
+            # Calculate available volume within 5% of max buy price
+            max_price = orders[0]['price']  # Highest buy order
+            price_threshold = max_price * 0.95
+            available_volume = sum(
+                o['volume_remain'] for o in orders
+                if o['price'] >= price_threshold
+            )
+            weighted_price = max_price
+            stored_orders = orders  # Store buy orders for depth validation
         else:
-            # For faction items: use lowest price (we're competing as sellers)
+            # For faction items in normal mode: use lowest sell price (we're competing as sellers)
             # Calculate available volume within 5% of min price
+            min_price = orders[0]['price']
             price_threshold = min_price * 1.05
             available_volume = sum(
                 o['volume_remain'] for o in orders
                 if o['price'] <= price_threshold
             )
             weighted_price = min_price
-            stored_orders = None  # Don't need order book for faction items
+            stored_orders = None
 
         # Get daily volume from history
         history = self.get_market_history(THE_FORGE_REGION_ID, type_id)
@@ -320,6 +366,162 @@ def calculate_purchase_cost(orders: List[Dict], quantity_needed: int) -> float:
     return total_cost
 
 
+def calculate_sell_revenue(orders: List[Dict], quantity_to_sell: int) -> Tuple[float, float]:
+    """
+    Calculate the actual revenue from selling a specific quantity by walking through buy orders.
+
+    Args:
+        orders: List of buy orders sorted by price (highest first)
+        quantity_to_sell: Total units to sell
+
+    Returns:
+        Tuple of (total_revenue, average_price)
+        If not enough buy orders exist, uses the last available price for remaining units
+    """
+    if not orders:
+        return 0.0, 0.0
+
+    total_revenue = 0.0
+    remaining = quantity_to_sell
+
+    for order in orders:
+        if remaining <= 0:
+            break
+
+        available = order['volume_remain']
+        to_sell = min(remaining, available)
+        total_revenue += to_sell * order['price']
+        remaining -= to_sell
+
+    # If we couldn't fulfill the entire sell order, use the last price for remaining
+    if remaining > 0 and orders:
+        total_revenue += remaining * orders[-1]['price']
+
+    average_price = total_revenue / quantity_to_sell if quantity_to_sell > 0 else 0.0
+    return total_revenue, average_price
+
+
+def validate_liquidation_depth(
+    purchases: List[Tuple['ItemAnalysis', int]],
+    safety_multiplier: float = 2.0,
+    max_price_drop: float = 0.05
+) -> Tuple[List[Tuple['ItemAnalysis', int]], List[str]]:
+    """
+    Validate that buy order depth can support the recommended volumes in liquidation mode.
+
+    For each purchase, checks if selling 2X the recommended volume would cause the
+    average price to drop by more than 5%. If so, reduces the quantity to stay within
+    safe depth.
+
+    Args:
+        purchases: List of (ItemAnalysis, quantity) tuples from optimization
+        safety_multiplier: Check depth at this multiple of recommended volume (default: 2.0)
+        max_price_drop: Maximum acceptable price drop as fraction (default: 0.05 = 5%)
+
+    Returns:
+        Tuple of (adjusted_purchases, warnings)
+        - adjusted_purchases: Updated list with safe quantities
+        - warnings: List of warning messages about adjusted items
+    """
+    adjusted_purchases = []
+    warnings = []
+
+    for analysis, quantity in purchases:
+        item = analysis.item
+        total_units = quantity * item.units_per_purchase
+
+        # Skip validation if no buy orders available
+        if not analysis.faction_market.sell_orders:
+            adjusted_purchases.append((analysis, quantity))
+            continue
+
+        buy_orders = analysis.faction_market.sell_orders
+        base_price = analysis.faction_market.price
+
+        # Check the average price at safety_multiplier * recommended volume
+        test_volume = int(total_units * safety_multiplier)
+        _, avg_price_at_2x = calculate_sell_revenue(buy_orders, test_volume)
+
+        # Calculate price drop percentage
+        if base_price > 0:
+            price_drop = (base_price - avg_price_at_2x) / base_price
+        else:
+            price_drop = 0.0
+
+        # If price drops too much, find the safe quantity
+        if price_drop > max_price_drop:
+            # Binary search for maximum safe quantity
+            safe_units = find_safe_sell_quantity(
+                buy_orders, base_price, max_price_drop
+            )
+
+            if safe_units < total_units:
+                # Reduce quantity to safe amount
+                safe_quantity = max(1, safe_units // item.units_per_purchase)
+                adjusted_purchases.append((analysis, safe_quantity))
+
+                warning = (
+                    f"⚠ {item.name}: Reduced from {quantity} to {safe_quantity} purchases "
+                    f"({total_units} → {safe_quantity * item.units_per_purchase} units) "
+                    f"due to insufficient buy order depth. "
+                    f"Price would drop {price_drop*100:.1f}% at 2X volume."
+                )
+                warnings.append(warning)
+            else:
+                # Safe as-is
+                adjusted_purchases.append((analysis, quantity))
+        else:
+            # Depth is sufficient
+            adjusted_purchases.append((analysis, quantity))
+
+    return adjusted_purchases, warnings
+
+
+def find_safe_sell_quantity(
+    buy_orders: List[Dict],
+    target_price: float,
+    max_price_drop: float
+) -> int:
+    """
+    Binary search to find the maximum quantity that can be sold without exceeding max_price_drop.
+
+    Args:
+        buy_orders: List of buy orders sorted by price (highest first)
+        target_price: Base price (highest buy order)
+        max_price_drop: Maximum acceptable price drop as fraction
+
+    Returns:
+        Maximum safe quantity in units
+    """
+    if not buy_orders:
+        return 0
+
+    # Calculate total available volume
+    total_volume = sum(o['volume_remain'] for o in buy_orders)
+
+    # Binary search for maximum safe quantity
+    low, high = 0, total_volume
+    safe_qty = 0
+
+    while low <= high:
+        mid = (low + high) // 2
+        if mid == 0:
+            break
+
+        _, avg_price = calculate_sell_revenue(buy_orders, mid)
+        price_drop = (target_price - avg_price) / target_price if target_price > 0 else 0.0
+
+        if price_drop <= max_price_drop:
+            # This quantity is safe, try larger
+            safe_qty = mid
+            low = mid + 1
+        else:
+            # Too much price drop, try smaller
+            high = mid - 1
+
+    return safe_qty
+
+
 @dataclass
 class ItemAnalysis:
     """Analysis of an LP store item including market data"""
@@ -335,7 +537,7 @@ class ItemAnalysis:
     lp_per_m3: float                # LP cost per m³ (cargo efficiency)
 
 
-def analyze_items(items: List[LPStoreItem], esi: ESIClient) -> List[ItemAnalysis]:
+def analyze_items(items: List[LPStoreItem], esi: ESIClient, liquidation_mode: bool = False) -> List[ItemAnalysis]:
     """
     Fetch market data and analyze profitability for all LP store items.
 
@@ -345,29 +547,33 @@ def analyze_items(items: List[LPStoreItem], esi: ESIClient) -> List[ItemAnalysis
     Args:
         items: List of LP store items to analyze
         esi: ESI API client (real or sample mode)
+        liquidation_mode: If True, use buy order prices for faction items (instant sell)
 
     Returns:
         List of ItemAnalysis objects for profitable items only.
         Unprofitable items or items with missing market data are excluded.
     """
     analyses = []
-    
-    print("Fetching market data from Jita...")
+
+    mode_text = "LIQUIDATION MODE (buy orders)" if liquidation_mode else "normal mode (sell orders)"
+    print(f"Fetching market data from Jita ({mode_text})...")
     for i, item in enumerate(items):
         print(f"  [{i+1}/{len(items)}] {item.name}...", end=" ", flush=True)
-        
+
         # Get base item prices (what we pay to buy T1 items)
         base_market = esi.get_market_data(item.base_type_id, is_base_item=True)
         if base_market is None:
             print("No base item data")
             continue
-        
-        # Get faction item prices (what we sell for)
-        faction_market = esi.get_market_data(item.faction_type_id, is_base_item=False)
+
+        # Get faction item prices
+        # Normal mode: sell order prices (what we compete with)
+        # Liquidation mode: buy order prices (instant sell to buyers)
+        faction_market = esi.get_market_data(item.faction_type_id, is_base_item=False, use_buy_orders=liquidation_mode)
         if faction_market is None or faction_market.price <= 0:
             print("No faction item data")
             continue
-        
+
         # Calculate costs and revenue per LP store purchase
         # For base items, use actual order book cost if available
         if base_market.sell_orders:
@@ -378,11 +584,11 @@ def analyze_items(items: List[LPStoreItem], esi: ESIClient) -> List[ItemAnalysis
         faction_revenue = faction_market.price * item.units_per_purchase
         total_cost = base_cost + item.isk_cost
         profit = faction_revenue - total_cost
-        
+
         if profit <= 0:
             print(f"Not profitable ({profit/item.lp_cost:.0f} ISK/LP)")
             continue
-        
+
         net_isk_per_lp = profit / item.lp_cost
         daily_volume_purchases = faction_market.daily_volume / item.units_per_purchase
         lp_per_m3 = item.lp_cost / item.volume_per_purchase if item.volume_per_purchase > 0 else 0
@@ -400,9 +606,9 @@ def analyze_items(items: List[LPStoreItem], esi: ESIClient) -> List[ItemAnalysis
             lp_per_m3=lp_per_m3
         )
         analyses.append(analysis)
-        
+
         print(f"{net_isk_per_lp:.0f} ISK/LP (base: {base_market.price:.1f}, faction: {faction_market.price:.1f})")
-    
+
     return analyses
 
 
@@ -626,7 +832,8 @@ def generate_multibuy(purchases: List[Tuple[ItemAnalysis, int]]) -> str:
 def generate_report(
     purchases: List[Tuple[ItemAnalysis, int]],
     available_lp: int,
-    cargo_capacity: float
+    cargo_capacity: float,
+    liquidation_mode: bool = False
 ) -> str:
     """
     Generate a detailed profitability report for the optimized purchases.
@@ -640,6 +847,7 @@ def generate_report(
         purchases: List of (ItemAnalysis, quantity) tuples
         available_lp: Total LP available
         cargo_capacity: Maximum cargo volume in m³
+        liquidation_mode: Whether quick liquidation mode is enabled
 
     Returns:
         Multi-line formatted report string
@@ -651,6 +859,8 @@ def generate_report(
     lines.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     lines.append(f"Available LP: {available_lp:,}")
     lines.append(f"Cargo Capacity: {cargo_capacity:,.1f} m³")
+    if liquidation_mode:
+        lines.append("Mode: QUICK LIQUIDATION (using buy order prices for instant sell)")
     lines.append("")
     
     total_lp_used = 0
@@ -717,6 +927,7 @@ def main(
     max_days: float = typer.Option(14.0, "--max-days", help="Max days to sell inventory"),
     min_liquidity: float = typer.Option(0.3, "--min-liquidity", help="Min daily volume in purchases/day"),
     sample: bool = typer.Option(False, "--sample", help="Use sample data instead of live API"),
+    liquidate: bool = typer.Option(False, "--liquidate", help="Quick liquidation mode: use buy order prices (instant sell)"),
     categories: Optional[List[str]] = typer.Option(
         None,
         "--categories",
@@ -733,7 +944,7 @@ def main(
         help="Days worth of volume to allocate per round when diversifying"
     ),
     lp_density: float = typer.Option(
-        0.7,
+        0.5,
         "--lp-density",
         help="Weight for LP/m³ optimization (0-1). Higher = favor denser items to use more LP per cargo"
     ),
@@ -759,6 +970,8 @@ def main(
     print(f"Cargo: {cargo:,.1f} m³")
     if sample:
         print("Mode: SAMPLE DATA (run without --sample for live prices)")
+    if liquidate:
+        print("Mode: QUICK LIQUIDATION (using buy order prices for instant sell)")
     print()
 
     items = LP_STORE_ITEMS
@@ -767,7 +980,7 @@ def main(
         print(f"Categories: {', '.join(categories)}")
 
     esi = ESIClient(use_sample=sample)
-    analyses = analyze_items(items, esi)
+    analyses = analyze_items(items, esi, liquidation_mode=liquidate)
 
     if not analyses:
         print("Error: No profitable items found")
@@ -792,7 +1005,79 @@ def main(
         print("Error: No viable purchases")
         raise typer.Exit(1)
 
-    report = generate_report(purchases, lp, cargo)
+    # In liquidation mode, validate buy order depth to ensure safe selling
+    if liquidate:
+        print("\nValidating buy order depth (checking 2X volume)...")
+        purchases, depth_warnings = validate_liquidation_depth(purchases)
+        if depth_warnings:
+            print("\n⚠ BUY ORDER DEPTH WARNINGS:")
+            for warning in depth_warnings:
+                print(f"  {warning}")
+            print()
+
+        # Iteratively re-optimize with freed resources until LP or cargo exhausted
+        max_iterations = 10
+        iteration = 0
+        any_warnings = bool(depth_warnings)
+
+        if any_warnings:
+            print("Re-optimizing with freed LP and cargo...")
+
+        while iteration < max_iterations:
+            # Calculate used resources from current purchases
+            used_lp = sum(qty * analysis.item.lp_cost for analysis, qty in purchases)
+            used_cargo = sum(qty * analysis.item.volume_per_purchase for analysis, qty in purchases)
+            remaining_lp = lp - used_lp
+            remaining_cargo = cargo - used_cargo
+
+            # Stop if no significant resources remain
+            if remaining_lp < 1000 or remaining_cargo < 10.0:
+                break
+
+            # Get items that were already allocated (to avoid duplicates)
+            allocated_items = {analysis.item.faction_type_id for analysis, _ in purchases}
+
+            # Get remaining items that can be allocated
+            remaining_analyses = [a for a in analyses if a.item.faction_type_id not in allocated_items]
+
+            if not remaining_analyses:
+                break
+
+            # Re-optimize with remaining resources
+            additional_purchases = optimize_purchases(
+                remaining_analyses, remaining_lp, remaining_cargo,
+                min_liquidity=min_liquidity,
+                max_days_to_sell=max_days,
+                diversify=not no_diversify,
+                batch_size_days=batch_days,
+                lp_density_weight=lp_density
+            )
+
+            if not additional_purchases:
+                break
+
+            # Validate the additional purchases
+            additional_purchases, additional_warnings = validate_liquidation_depth(additional_purchases)
+
+            if not additional_purchases:
+                break
+
+            # Merge with existing purchases
+            purchases.extend(additional_purchases)
+
+            if additional_warnings:
+                if iteration == 0 and any_warnings:
+                    print("Additional depth warnings:")
+                for warning in additional_warnings:
+                    print(f"  {warning}")
+
+            iteration += 1
+
+        if any_warnings and iteration > 0:
+            print(f"Completed {iteration} re-optimization iteration(s)")
+            print()
+
+    report = generate_report(purchases, lp, cargo, liquidation_mode=liquidate)
     print()
     print(report)
 
